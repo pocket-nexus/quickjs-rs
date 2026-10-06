@@ -9,6 +9,7 @@
    usage: minor_gc_reentry <scenario>   (no argument: list scenarios) */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include "quickjs.h"
 
@@ -17,7 +18,11 @@ static int g_hook_depth, g_hook_max_depth, g_hook_begin, g_hook_end;
 static int g_failures;
 static JSClassID g_class_id;
 static int g_finalized;
-static int g_finalizer_allocs = 0; /* finalizers allocate while set */
+/* finalizers allocate while set; 2: they also force the size-based
+   trigger for their own allocations */
+static int g_finalizer_allocs = 0;
+static int g_in_minor, g_in_pending; /* the test is inside that call */
+static int g_fin_in_minor, g_fin_in_pending;
 
 #define CHECK(cond)                                                     \
     do {                                                                \
@@ -121,11 +126,22 @@ static void hook_collect(JSRuntime *rt, int end)
    finalizer creates is never garbage. */
 static void fin_finalizer(JSRuntime *rt, JSValue val)
 {
+    uint32_t young0, young1, pending;
+    JS_GetGCCounts(rt, &young0, &pending);
     g_finalized++;
+    g_fin_in_minor += g_in_minor;
+    g_fin_in_pending += g_in_pending;
+    if (g_finalizer_allocs == 2)
+        JS_SetGCThreshold(rt, 0);
     if (g_finalizer_allocs) {
         alloc_one();
         alloc_one();
     }
+    if (g_finalizer_allocs == 2)
+        JS_SetGCThreshold(rt, SIZE_MAX / 2);
+    /* a collection started here would have made the young objects old */
+    JS_GetGCCounts(rt, &young1, &pending);
+    CHECK(young1 >= young0);
 }
 
 static void define_class(JSRuntime *rt)
@@ -151,11 +167,36 @@ static void make_fin_cycle(JSValue holder, int i)
     JS_FreeValue(g_ctx, o);
 }
 
+/* host objects under an old array that only a young cycle references: a
+   minor collection frees the cycle and queues the array, and
+   JS_FreePendingObjects() then runs their finalizers */
+static void make_pending_tree(JSRuntime *rt)
+{
+    JSValue tree = JS_NewArray(g_ctx);
+    for (int k = 0; k < 4; k++)
+        JS_SetPropertyUint32(g_ctx, tree, k, JS_NewObjectClass(g_ctx, g_class_id));
+    JS_PromoteGCObjects(rt);
+    JSValue a = JS_NewObject(g_ctx);
+    JSValue b = JS_NewObject(g_ctx);
+    JS_SetPropertyStr(g_ctx, a, "b", JS_DupValue(g_ctx, b));
+    JS_SetPropertyStr(g_ctx, b, "a", JS_DupValue(g_ctx, a));
+    JS_SetPropertyStr(g_ctx, a, "tree", tree);
+    JS_FreeValue(g_ctx, a);
+    JS_FreeValue(g_ctx, b);
+}
+
+static void run_minor(JSRuntime *rt)
+{
+    g_in_minor = 1;
+    JS_RunGCMinor(rt);
+    g_in_minor = 0;
+}
+
 typedef struct {
     const char *name;
     void (*hook)(JSRuntime *rt, int end);
     uint32_t young_limit;
-    int fin; /* finalizer-allocation workload */
+    int fin; /* finalizer-allocation workload (g_finalizer_allocs) */
 } Scenario;
 
 static const Scenario scenarios[] = {
@@ -166,6 +207,8 @@ static const Scenario scenarios[] = {
     { "hook-collect", hook_collect, 2, 0 },
     { "finalizer-alloc", NULL, 1, 1 },
     { "finalizer-alloc-hook", hook_alloc_begin, 3, 1 },
+    /* explicit minor collections and pending releases only */
+    { "finalizer-alloc-explicit", NULL, 0, 2 },
 };
 
 static int run(const Scenario *sc)
@@ -192,7 +235,7 @@ static int run(const Scenario *sc)
     /* the size-based automatic collection fires on every allocation too
        (it must not start inside a minor one either) */
     if (sc->fin)
-        JS_SetGCThreshold(rt, 0);
+        JS_SetGCThreshold(rt, sc->fin == 1 ? 0 : SIZE_MAX / 2);
     g_finalizer_allocs = sc->fin;
 
     for (int i = 0; i < iters; i++) {
@@ -201,6 +244,21 @@ static int run(const Scenario *sc)
         CHECK(!JS_IsException(v));
         JS_ToInt32(ctx, &sum, v);
         JS_FreeValue(ctx, v);
+        if (sc->fin == 2) {
+            JSValue live;
+            for (int k = 0; k < 8; k++)
+                make_fin_cycle(JS_UNDEFINED, k);
+            run_minor(rt);
+            make_pending_tree(rt);
+            run_minor(rt);
+            /* a young object for the finalizer check */
+            live = JS_NewObject(ctx);
+            g_in_pending = 1;
+            while (JS_FreePendingObjects(rt, 3)) {}
+            g_in_pending = 0;
+            JS_FreeValue(ctx, live);
+            continue;
+        }
         if (sc->fin) {
             for (int k = 0; k < 8; k++)
                 make_fin_cycle(i % 4 == 0 ? holder : JS_UNDEFINED, i * 8 + k);
@@ -237,11 +295,16 @@ static int run(const Scenario *sc)
     }
     if (sc->fin)
         CHECK(g_finalized > 0);
+    if (sc->fin == 2) {
+        CHECK(g_fin_in_minor > 0);
+        CHECK(g_fin_in_pending > 0);
+    }
     CHECK(pending == 0);
 
-    printf("%s: checksum=%d hooks=%d/%d max_depth=%d finalized=%d obj=%lld\n",
+    printf("%s: checksum=%d hooks=%d/%d max_depth=%d finalized=%d "
+           "(in minor %d, in pending %d) obj=%lld\n",
            sc->name, sum, g_hook_begin, g_hook_end, g_hook_max_depth,
-           g_finalized, (long long)u.obj_count);
+           g_finalized, g_fin_in_minor, g_fin_in_pending, (long long)u.obj_count);
 
     JS_FreeValue(ctx, step);
     JS_FreeValue(ctx, global);
