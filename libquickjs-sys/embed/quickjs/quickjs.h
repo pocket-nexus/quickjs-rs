@@ -388,6 +388,11 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
+void JS_RunGCMinor(JSRuntime *rt);
+void JS_PromoteGCObjects(JSRuntime *rt);
+void JS_SetGCYoungLimit(JSRuntime *rt, uint32_t limit, void (*hook)(JSRuntime *rt, int end));
+void JS_GetGCCounts(JSRuntime *rt, uint32_t *young, uint32_t *pending);
+JS_BOOL JS_FreePendingObjects(JSRuntime *rt, int max_count);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);

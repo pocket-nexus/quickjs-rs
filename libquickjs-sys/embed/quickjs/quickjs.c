@@ -302,7 +302,8 @@ typedef struct JSMallocBlockHeader {
         uint16_t free_next; /* FREE_NIL if none */
     } u;
     uint8_t block_size_idx;
-    uint8_t gc_obj_type : 7;
+    uint8_t gc_obj_type : 6;
+    uint8_t old : 1; /* survived a collection: skipped by minor GCs */
     uint8_t mark : 1;
     int ref_count;
     __attribute__((aligned(JS_MALLOC_ALIGN))) uint8_t user_data[];
@@ -367,7 +368,22 @@ struct JSRuntime {
     /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
     struct list_head gc_zero_ref_count_list;
     struct list_head tmp_obj_list; /* used during GC */
+    /* objects that survived a collection ('old' set). A minor GC only
+       walks gc_obj_list; references from old objects act as roots. */
+    struct list_head gc_old_list;
+    /* objects whose refcount reached zero while a minor GC removed
+       cycles but which are not part of the freed cycles */
+    struct list_head gc_deferred_list;
+    /* unreachable objects (ref_count == 0) freed a few at a time by
+       JS_FreePendingObjects() */
+    struct list_head gc_pending_free_list;
     JSGCPhaseEnum gc_phase : 8;
+    uint8_t gc_minor;
+    /* approximate number of young GC objects; a minor GC runs from
+       js_trigger_gc() when it reaches gc_young_limit (0 = off) */
+    uint32_t gc_young_count;
+    uint32_t gc_young_limit;
+    void (*gc_young_hook)(JSRuntime *rt, int end); /* diagnostics */
     size_t malloc_gc_threshold;
     struct list_head weakref_list; /* list of JSWeakRefHeader.link */
 #ifdef DUMP_LEAKS
@@ -1408,7 +1424,7 @@ static JSValue js_c_function_data_call(JSContext *ctx, JSValueConst func_obj,
 static JSAtom js_symbol_to_atom(JSContext *ctx, JSValue val);
 static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type);
-static void remove_gc_object(JSGCObjectHeader *h);
+static void remove_gc_object(JSRuntime *rt, JSGCObjectHeader *h);
 static JSValue js_instantiate_prototype(JSContext *ctx, JSObject *p, JSAtom atom, void *opaque);
 static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                  void *opaque);
@@ -1714,6 +1730,7 @@ static void *__js_realloc(JSMallocContext *s, void *ptr, size_t size)
         /* copy the GC data */
         new_b->gc_obj_type = b->gc_obj_type;
         new_b->mark = b->mark;
+        new_b->old = b->old;
         new_b->ref_count = b->ref_count;
         /* copy the data */
         old_size = block_size - sizeof(JSMallocBlockHeader);
@@ -1809,6 +1826,14 @@ static __maybe_unused void js_malloc_iter(JSMallocContext *s, JSMallocIterFunc *
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     BOOL force_gc;
+    if (rt->gc_young_limit != 0 && rt->gc_young_count >= rt->gc_young_limit &&
+        rt->gc_phase == JS_GC_PHASE_NONE) {
+        if (rt->gc_young_hook)
+            rt->gc_young_hook(rt, 0);
+        JS_RunGCMinor(rt);
+        if (rt->gc_young_hook)
+            rt->gc_young_hook(rt, 1);
+    }
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = TRUE;
 #else
@@ -2114,6 +2139,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
     init_list_head(&rt->gc_zero_ref_count_list);
+    init_list_head(&rt->gc_old_list);
+    init_list_head(&rt->gc_deferred_list);
+    init_list_head(&rt->gc_pending_free_list);
     rt->gc_phase = JS_GC_PHASE_NONE;
     init_list_head(&rt->weakref_list);
 
@@ -2860,7 +2888,7 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
 
     list_del(&ctx->link);
-    remove_gc_object(&ctx->header);
+    remove_gc_object(rt, &ctx->header);
     js_free_rt(ctx->rt, ctx);
 }
 
@@ -5344,7 +5372,7 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
         JS_FreeAtomRT(rt, pr->atom);
         pr++;
     }
-    remove_gc_object(&sh->header);
+    remove_gc_object(rt, &sh->header);
     js_free_rt(rt, sh);
 }
 
@@ -5391,7 +5419,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     sh = js_malloc(ctx, get_shape_size(new_hash_size, new_size));
     if (!sh)
         return -1;
-    remove_gc_object(&old_sh->header);
+    remove_gc_object(ctx->rt, &old_sh->header);
 
     js_rc(sh)->ref_count = 1;
     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
@@ -5454,7 +5482,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     sh = js_malloc(ctx, get_shape_size(new_hash_size, new_size));
     if (!sh)
         return -1;
-    remove_gc_object(&old_sh->header);
+    remove_gc_object(ctx->rt, &old_sh->header);
 
     js_rc(sh)->ref_count = 1;
     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
@@ -6208,7 +6236,7 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
                     async_func_free(rt, async_func);
                 }
             }
-            remove_gc_object(&var_ref->header);
+            remove_gc_object(rt, &var_ref->header);
             js_free_rt(rt, var_ref);
         }
     }
@@ -6403,7 +6431,7 @@ static void free_object(JSRuntime *rt, JSObject *p)
     p->u.func.var_refs = NULL;
     p->u.func.home_object = NULL;
 
-    remove_gc_object(&p->header);
+    remove_gc_object(rt, &p->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES) {
         if (js_rc(p)->ref_count == 0 && p->weakref_count == 0) {
             js_free_rt(rt, p);
@@ -6511,6 +6539,14 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
                 if (rt->gc_phase == JS_GC_PHASE_NONE) {
                     free_zero_refcount(rt);
                 }
+            } else if (rt->gc_minor && js_rc(p)->mark == 0) {
+                /* not one of the cycles being freed (an old object, or
+                   a survivor only an old object referenced): free it
+                   after the cycles */
+                list_del(&p->link);
+                list_add_tail(&p->link, &rt->gc_deferred_list);
+                js_rc(p)->mark = 1;
+                js_rc(p)->old = 1; /* no longer counted as young */
             }
         }
         break;
@@ -6572,12 +6608,16 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type)
 {
     js_rc(h)->mark = 0;
+    js_rc(h)->old = 0;
     js_rc(h)->gc_obj_type = type;
     list_add_tail(&h->link, &rt->gc_obj_list);
+    rt->gc_young_count++;
 }
 
-static void remove_gc_object(JSGCObjectHeader *h)
+static void remove_gc_object(JSRuntime *rt, JSGCObjectHeader *h)
 {
+    if (!js_rc(h)->old && rt->gc_young_count != 0)
+        rt->gc_young_count--;
     list_del(&h->link);
 }
 
@@ -6717,6 +6757,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
 
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (rt->gc_minor && js_rc(p)->old)
+        return;
     assert(js_rc(p)->ref_count > 0);
     js_rc(p)->ref_count--;
     if (js_rc(p)->ref_count == 0 && js_rc(p)->mark == 1) {
@@ -6749,6 +6791,8 @@ static void gc_decref(JSRuntime *rt)
 
 static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (rt->gc_minor && js_rc(p)->old)
+        return;
     js_rc(p)->ref_count++;
     if (js_rc(p)->ref_count == 1) {
         /* ref_count was 0: remove from tmp_obj_list and add at the
@@ -6761,6 +6805,8 @@ static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
 
 static void gc_scan_incref_child2(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (rt->gc_minor && js_rc(p)->old)
+        return;
     js_rc(p)->ref_count++;
 }
 
@@ -6843,8 +6889,83 @@ static void gc_free_cycles(JSRuntime *rt)
     init_list_head(&rt->gc_zero_ref_count_list);
 }
 
+/* append the objects of 'src' to 'dst' and empty 'src' */
+static void gc_list_append(struct list_head *dst, struct list_head *src)
+{
+    if (list_empty(src))
+        return;
+    src->next->prev = dst->prev;
+    dst->prev->next = src->next;
+    src->prev->next = dst;
+    dst->prev = src->prev;
+    init_list_head(src);
+}
+
+/* Free up to 'max_count' unreachable objects queued by JS_RunGCMinor()
+   (with everything their release makes unreachable queued behind
+   them). Returns TRUE if objects remain queued. */
+BOOL JS_FreePendingObjects(JSRuntime *rt, int max_count)
+{
+    struct list_head *el;
+    JSGCObjectHeader *p;
+    int n = 0;
+
+    if (rt->gc_phase != JS_GC_PHASE_NONE)
+        return !list_empty(&rt->gc_pending_free_list);
+    while (n < max_count && !list_empty(&rt->gc_pending_free_list)) {
+        el = rt->gc_pending_free_list.next;
+        p = list_entry(el, JSGCObjectHeader, link);
+        assert(js_rc(p)->ref_count == 0);
+        /* children reaching zero go to gc_zero_ref_count_list
+           instead of being freed recursively */
+        rt->gc_phase = JS_GC_PHASE_DECREF;
+        free_gc_object(rt, p);
+        rt->gc_phase = JS_GC_PHASE_NONE;
+        gc_list_append(&rt->gc_pending_free_list, &rt->gc_zero_ref_count_list);
+        n++;
+    }
+    return !list_empty(&rt->gc_pending_free_list);
+}
+
+/* move the old objects back so that a full collection walks them */
+static void gc_merge_old(JSRuntime *rt)
+{
+    struct list_head *el;
+    if (list_empty(&rt->gc_old_list))
+        return;
+    list_for_each(el, &rt->gc_old_list) {
+        js_rc(list_entry(el, JSGCObjectHeader, link))->old = 0;
+    }
+    /* old objects first, keeping allocation order */
+    rt->gc_old_list.prev->next = rt->gc_obj_list.next;
+    rt->gc_obj_list.next->prev = rt->gc_old_list.prev;
+    rt->gc_obj_list.next = rt->gc_old_list.next;
+    rt->gc_old_list.next->prev = &rt->gc_obj_list;
+    init_list_head(&rt->gc_old_list);
+}
+
+/* the survivors of a collection become old */
+static void gc_promote(JSRuntime *rt)
+{
+    struct list_head *el;
+    rt->gc_young_count = 0;
+    if (list_empty(&rt->gc_obj_list))
+        return;
+    list_for_each(el, &rt->gc_obj_list) {
+        js_rc(list_entry(el, JSGCObjectHeader, link))->old = 1;
+    }
+    /* append to the tail of gc_old_list */
+    rt->gc_obj_list.next->prev = rt->gc_old_list.prev;
+    rt->gc_old_list.prev->next = rt->gc_obj_list.next;
+    rt->gc_obj_list.prev->next = &rt->gc_old_list;
+    rt->gc_old_list.prev = rt->gc_obj_list.prev;
+    init_list_head(&rt->gc_obj_list);
+}
+
 static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 {
+    JS_FreePendingObjects(rt, INT32_MAX);
+    gc_merge_old(rt);
     if (remove_weak_objects) {
         /* free the weakly referenced object or symbol structures, delete
            the associated Map/Set entries and queue the finalization
@@ -6866,6 +6987,51 @@ static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 void JS_RunGC(JSRuntime *rt)
 {
     JS_RunGCInternal(rt, TRUE);
+    gc_promote(rt);
+}
+
+/* Collect only the cycles made of objects allocated since the previous
+   collection, then make the survivors old. References from old objects
+   keep young objects alive, so this never frees a live object; cycles
+   through old objects wait for JS_RunGC(). */
+void JS_RunGCMinor(JSRuntime *rt)
+{
+    if (rt->gc_phase != JS_GC_PHASE_NONE)
+        return;
+    gc_remove_weak_objects(rt);
+    rt->gc_minor = 1;
+    gc_decref(rt);
+    gc_scan(rt);
+    gc_free_cycles(rt);
+    rt->gc_minor = 0;
+    /* the deferred objects are unreachable: free them later, a few
+       at a time */
+    gc_list_append(&rt->gc_pending_free_list, &rt->gc_deferred_list);
+    gc_promote(rt);
+}
+
+void JS_SetGCYoungLimit(JSRuntime *rt, uint32_t limit,
+                        void (*hook)(JSRuntime *rt, int end))
+{
+    rt->gc_young_limit = limit;
+    rt->gc_young_hook = hook;
+}
+
+/* diagnostics: young objects and objects queued for freeing */
+void JS_GetGCCounts(JSRuntime *rt, uint32_t *young, uint32_t *pending)
+{
+    struct list_head *el;
+    uint32_t n = 0, m = 0;
+    list_for_each(el, &rt->gc_obj_list) n++;
+    list_for_each(el, &rt->gc_pending_free_list) m++;
+    *young = n;
+    *pending = m;
+}
+
+/* Make every object old without collecting (e.g. after loading). */
+void JS_PromoteGCObjects(JSRuntime *rt)
+{
+    gc_promote(rt);
 }
 
 /* Return false if not an object or if the object has already been
@@ -7018,7 +7184,9 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         }
     }
 
-    list_for_each(el, &rt->gc_obj_list) {
+    struct list_head *gc_lists[2] = { &rt->gc_obj_list, &rt->gc_old_list };
+    for (int gc_list_idx = 0; gc_list_idx < 2; gc_list_idx++)
+    list_for_each(el, gc_lists[gc_list_idx]) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         JSObject *p;
         JSShape *sh;
@@ -20912,7 +21080,7 @@ static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     JS_FreeValueRT(rt, s->resolving_funcs[0]);
     JS_FreeValueRT(rt, s->resolving_funcs[1]);
 
-    remove_gc_object(&s->header);
+    remove_gc_object(rt, &s->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && js_rc(s)->ref_count != 0) {
         list_add_tail(&s->header.link, &rt->gc_zero_ref_count_list);
     } else {
@@ -20929,6 +21097,11 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
             if (rt->gc_phase == JS_GC_PHASE_NONE) {
                 free_zero_refcount(rt);
             }
+        } else if (rt->gc_minor && js_rc(s)->mark == 0) {
+            list_del(&s->header.link);
+            list_add_tail(&s->header.link, &rt->gc_deferred_list);
+            js_rc(s)->mark = 1;
+            js_rc(s)->old = 1; /* no longer counted as young */
         }
     }
 }
@@ -29672,7 +29845,7 @@ static void js_free_module_def(JSRuntime *rt, JSModuleDef *m)
     if (m->link.next) {
         list_del(&m->link);
     }
-    remove_gc_object(&m->header);
+    remove_gc_object(rt, &m->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && js_rc(m)->ref_count != 0) {
         list_add_tail(&m->header.link, &rt->gc_zero_ref_count_list);
     } else {
@@ -36232,7 +36405,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         js_free_rt(rt, b->debug.source);
     }
 
-    remove_gc_object(&b->header);
+    remove_gc_object(rt, &b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && js_rc(b)->ref_count != 0) {
         list_add_tail(&b->header.link, &rt->gc_zero_ref_count_list);
     } else {
