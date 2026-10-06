@@ -27,6 +27,7 @@ build() { # build <output> <quickjs dir> <test source>
 
 build "$out/minor_gc_reentry" "$src" "$here/minor_gc_reentry.c"
 build "$out/gc_stock_equivalence" "$src" "$here/gc_stock_equivalence.c"
+build "$out/minor_gc_stress" "$src" "$here/minor_gc_stress.c"
 
 export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1
 export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
@@ -44,6 +45,22 @@ if "$out/gc_stock_equivalence" >"$out/equivalence.txt" 2>"$out/equivalence.log";
 else
     echo "FAIL gc_stock_equivalence (exit $?)"; tail -n 20 "$out/equivalence.log"; fail=1
 fi
+
+# Every schedule must free the same objects as full collections alone.
+counts() { sed -n 's/.*\(checksum=[^ ]*\) \(obj=[^ ]*\) \(prop=[^ ]*\) \(shape=[^ ]*\).*/\1 \2 \3 \4/p'; }
+want=$(TWICE=1 "$out/minor_gc_stress" 0 600 | counts)
+for run in "1" "2" "2 YOUNG=50" "2 YOUNG=500 BUDGET=1" "1 YOUNG=5 EVERY=3" \
+           "2 YOUNG=3000 BUDGET=100000"; do
+    set -- $run
+    mode=$1; shift
+    # a crash leaves no counts and fails the comparison
+    got=$(env TWICE=1 "$@" "$out/minor_gc_stress" "$mode" 600 | counts)
+    if [ -n "$want" ] && [ "$got" = "$want" ]; then
+        echo "PASS minor_gc_stress mode $run: $got"
+    else
+        echo "FAIL minor_gc_stress mode $run: '$got', full GC only: '$want'"; fail=1
+    fi
+done
 
 if [ -n "${STOCK_REV:-}" ]; then
     stock="$out/stock-quickjs"
