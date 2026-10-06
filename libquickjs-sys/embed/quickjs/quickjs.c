@@ -379,6 +379,12 @@ struct JSRuntime {
     struct list_head gc_pending_free_list;
     JSGCPhaseEnum gc_phase : 8;
     uint8_t gc_minor;
+    /* set once the host uses the minor collector API; until then
+       JS_RunGC() behaves as the stock collector */
+    uint8_t gc_generational;
+    /* a minor collection, its hook, a pending release or (generational
+       mode) a full collection is running: js_trigger_gc() only counts */
+    uint8_t gc_busy;
     /* approximate number of young GC objects; a minor GC runs from
        js_trigger_gc() when it reaches gc_young_limit (0 = off) */
     uint32_t gc_young_count;
@@ -1826,13 +1832,20 @@ static __maybe_unused void js_malloc_iter(JSMallocContext *s, JSMallocIterFunc *
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     BOOL force_gc;
+    /* allocations made by a collection in progress (finalizers) or by the
+       young-collection hook must not start another collection */
+    if (rt->gc_busy)
+        return;
     if (rt->gc_young_limit != 0 && rt->gc_young_count >= rt->gc_young_limit &&
         rt->gc_phase == JS_GC_PHASE_NONE) {
-        if (rt->gc_young_hook)
-            rt->gc_young_hook(rt, 0);
+        void (*hook)(JSRuntime *rt, int end) = rt->gc_young_hook;
+        rt->gc_busy = 1;
+        if (hook)
+            hook(rt, 0);
         JS_RunGCMinor(rt);
-        if (rt->gc_young_hook)
-            rt->gc_young_hook(rt, 1);
+        if (hook)
+            hook(rt, 1);
+        rt->gc_busy = 0;
     }
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = TRUE;
@@ -6909,9 +6922,13 @@ BOOL JS_FreePendingObjects(JSRuntime *rt, int max_count)
     struct list_head *el;
     JSGCObjectHeader *p;
     int n = 0;
+    uint8_t busy;
 
-    if (rt->gc_phase != JS_GC_PHASE_NONE)
+    if (rt->gc_phase != JS_GC_PHASE_NONE ||
+        list_empty(&rt->gc_pending_free_list))
         return !list_empty(&rt->gc_pending_free_list);
+    busy = rt->gc_busy;
+    rt->gc_busy = 1;
     while (n < max_count && !list_empty(&rt->gc_pending_free_list)) {
         el = rt->gc_pending_free_list.next;
         p = list_entry(el, JSGCObjectHeader, link);
@@ -6924,6 +6941,7 @@ BOOL JS_FreePendingObjects(JSRuntime *rt, int max_count)
         gc_list_append(&rt->gc_pending_free_list, &rt->gc_zero_ref_count_list);
         n++;
     }
+    rt->gc_busy = busy;
     return !list_empty(&rt->gc_pending_free_list);
 }
 
@@ -6964,6 +6982,11 @@ static void gc_promote(JSRuntime *rt)
 
 static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 {
+    uint8_t busy = rt->gc_busy;
+    /* the stock collector lets finalizers start a nested collection;
+       keep that unless the minor collector is in use */
+    if (rt->gc_generational)
+        rt->gc_busy = 1;
     JS_FreePendingObjects(rt, INT32_MAX);
     gc_merge_old(rt);
     if (remove_weak_objects) {
@@ -6982,12 +7005,14 @@ static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 
     /* free the GC objects in a cycle */
     gc_free_cycles(rt);
+    rt->gc_busy = busy;
 }
 
 void JS_RunGC(JSRuntime *rt)
 {
     JS_RunGCInternal(rt, TRUE);
-    gc_promote(rt);
+    if (rt->gc_generational)
+        gc_promote(rt);
 }
 
 /* Collect only the cycles made of objects allocated since the previous
@@ -6996,8 +7021,12 @@ void JS_RunGC(JSRuntime *rt)
    through old objects wait for JS_RunGC(). */
 void JS_RunGCMinor(JSRuntime *rt)
 {
+    uint8_t busy;
     if (rt->gc_phase != JS_GC_PHASE_NONE)
         return;
+    rt->gc_generational = 1;
+    busy = rt->gc_busy;
+    rt->gc_busy = 1;
     gc_remove_weak_objects(rt);
     rt->gc_minor = 1;
     gc_decref(rt);
@@ -7008,11 +7037,18 @@ void JS_RunGCMinor(JSRuntime *rt)
        at a time */
     gc_list_append(&rt->gc_pending_free_list, &rt->gc_deferred_list);
     gc_promote(rt);
+    rt->gc_busy = busy;
 }
 
+/* Run a minor collection from js_trigger_gc() once 'limit' young objects
+   exist (0 = never). 'hook' is called with end = 0 before and end = 1
+   after it; objects it allocates are only counted (no collection starts
+   until the hook returns). */
 void JS_SetGCYoungLimit(JSRuntime *rt, uint32_t limit,
                         void (*hook)(JSRuntime *rt, int end))
 {
+    if (limit != 0)
+        rt->gc_generational = 1;
     rt->gc_young_limit = limit;
     rt->gc_young_hook = hook;
 }
@@ -7031,6 +7067,10 @@ void JS_GetGCCounts(JSRuntime *rt, uint32_t *young, uint32_t *pending)
 /* Make every object old without collecting (e.g. after loading). */
 void JS_PromoteGCObjects(JSRuntime *rt)
 {
+    /* not from a finalizer while objects are being freed */
+    if (rt->gc_phase != JS_GC_PHASE_NONE)
+        return;
+    rt->gc_generational = 1;
     gc_promote(rt);
 }
 

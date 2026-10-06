@@ -362,6 +362,26 @@ extern "C" {
     /// refcounting reclaims acyclic garbage regardless). Default is 256 KB.
     pub fn JS_SetGCThreshold(rt: *mut JSRuntime, gc_threshold: size_t);
     pub fn JS_RunGC(rt: *mut JSRuntime);
+
+    /// Minor collection: frees cycles among the objects created since the
+    /// previous collection, then marks the survivors old. Nothing changes
+    /// for a runtime that never calls this or the functions below.
+    pub fn JS_RunGCMinor(rt: *mut JSRuntime);
+    /// Marks every object old without collecting (e.g. after loading).
+    pub fn JS_PromoteGCObjects(rt: *mut JSRuntime);
+    /// Runs a minor collection once `limit` young objects exist (0 = never).
+    /// `hook` is called with 0 before and 1 after it; objects the hook
+    /// allocates are counted but never start another collection.
+    pub fn JS_SetGCYoungLimit(
+        rt: *mut JSRuntime,
+        limit: u32,
+        hook: Option<unsafe extern "C" fn(rt: *mut JSRuntime, end: libc::c_int)>,
+    );
+    /// Diagnostics: young objects, and objects queued for release.
+    pub fn JS_GetGCCounts(rt: *mut JSRuntime, young: *mut u32, pending: *mut u32);
+    /// Frees up to `max_count` objects queued by minor collections; returns
+    /// nonzero while objects remain queued.
+    pub fn JS_FreePendingObjects(rt: *mut JSRuntime, max_count: libc::c_int) -> libc::c_int;
 }
 
 /// Custom allocator hooks so QuickJS can use the host (Rust/PSP) allocator
@@ -458,6 +478,60 @@ mod tests {
             assert!(JS_IsUndefined(JS_UNDEFINED));
 
             JS_FreeValue(context, value);
+            JS_FreeContext(context);
+            JS_FreeRuntime(runtime);
+        }
+    }
+
+    static mut HOOK_CTX: *mut JSContext = core::ptr::null_mut();
+    static mut HOOK_DEPTH: i32 = 0;
+    static mut HOOK_MAX_DEPTH: i32 = 0;
+    static mut HOOK_CALLS: [i32; 2] = [0, 0];
+
+    unsafe extern "C" fn allocating_hook(_rt: *mut JSRuntime, end: libc::c_int) {
+        HOOK_DEPTH += 1;
+        HOOK_MAX_DEPTH = HOOK_MAX_DEPTH.max(HOOK_DEPTH);
+        HOOK_CALLS[end as usize] += 1;
+        // Two live objects: the second allocation sees the limit reached.
+        let a = JS_NewObject(HOOK_CTX);
+        let b = JS_NewObject(HOOK_CTX);
+        JS_FreeValue(HOOK_CTX, b);
+        JS_FreeValue(HOOK_CTX, a);
+        HOOK_DEPTH -= 1;
+    }
+
+    #[test]
+    fn young_collection_hook_may_allocate() {
+        unsafe {
+            let runtime = JS_NewRuntime();
+            let context = JS_NewContext(runtime);
+            HOOK_CTX = context;
+            JS_PromoteGCObjects(runtime);
+            JS_SetGCYoungLimit(runtime, 1, Some(allocating_hook));
+
+            let source = b"var keep = []; for (var i = 0; i < 2000; i++) {\n\
+                var a = {i: i}; var b = {a: a}; a.b = b; if (i % 10 == 0) keep.push(a); }\n\
+                keep.length\0";
+            let filename = b"young-hook.js\0";
+            let value = JS_Eval(
+                context,
+                source.as_ptr().cast(),
+                source.len() - 1,
+                filename.as_ptr().cast(),
+                JS_EVAL_TYPE_GLOBAL as libc::c_int,
+            );
+            assert!(!JS_IsException(value));
+            let mut kept = 0.0;
+            assert_eq!(JS_ToFloat64(context, &mut kept, value), 0);
+            assert_eq!(kept, 200.0);
+            JS_FreeValue(context, value);
+
+            JS_SetGCYoungLimit(runtime, 0, None);
+            while JS_FreePendingObjects(runtime, 100) != 0 {}
+            assert!(HOOK_CALLS[0] > 0);
+            assert_eq!(HOOK_CALLS[0], HOOK_CALLS[1]);
+            assert_eq!(HOOK_MAX_DEPTH, 1);
+
             JS_FreeContext(context);
             JS_FreeRuntime(runtime);
         }
