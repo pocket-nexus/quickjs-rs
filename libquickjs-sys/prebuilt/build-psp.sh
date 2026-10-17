@@ -34,11 +34,13 @@ case "$clang_version" in
 esac
 
 # The flags of a PSP host build (pocketjs tools/psp.ts), plus prefix maps so
-# the archive does not carry this machine's paths.
+# the archive does not carry this machine's paths, and -nostdlibinc so the
+# headers come from the PSP SDK and clang alone, not from the host's
+# /usr/include (glibc's limits.h breaks the build on Linux).
 cflags="-target mipsel-sony-psp -mcpu=mips2 -msingle-float -mlittle-endian -mno-abicalls -fno-pic -G0"
 cflags="$cflags -mno-check-zero-division -fno-stack-protector -O2"
 cflags="$cflags -ffile-prefix-map=$target_dir=/build -ffile-prefix-map=$PSP_SDK=/sdk"
-cflags="$cflags -I$PSP_SDK/psp/include -I$PSP_SDK/psp/sdk/include"
+cflags="$cflags -nostdlibinc -I$PSP_SDK/psp/include -I$PSP_SDK/psp/sdk/include"
 
 (
   cd "$repo"
