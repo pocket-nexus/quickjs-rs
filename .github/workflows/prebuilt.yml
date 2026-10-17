@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Read pinned inputs
-        run: grep -E '^[A-Z_]+=' libquickjs-sys/prebuilt/psp.env >> "$GITHUB_ENV"
+        run: grep -E '^[A-Z][A-Z0-9_]*=' libquickjs-sys/prebuilt/psp.env >> "$GITHUB_ENV"
 
       - name: Install LLVM ${{ env.LLVM_MAJOR }}
         run: |
