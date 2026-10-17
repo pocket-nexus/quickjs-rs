@@ -46,6 +46,7 @@ fn main() {
 #[cfg(feature = "bundled")]
 fn main() {
     println!("cargo:rerun-if-env-changed=PSPDEV");
+    println!("cargo:rerun-if-env-changed=QUICKJS_PREBUILT_LIB");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let embed_path = manifest_dir.join("embed");
@@ -56,6 +57,25 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_default();
     let is_psp = target.contains("psp");
     let is_vita = target.contains("vita");
+
+    // A static library this crate's own sources were compiled into for this
+    // target (libquickjs-sys/prebuilt): link it and run no C compiler.
+    if let Some(prebuilt) = env::var_os("QUICKJS_PREBUILT_LIB") {
+        let prebuilt = PathBuf::from(prebuilt);
+        println!("cargo:rerun-if-changed={}", prebuilt.display());
+        assert!(
+            prebuilt.is_file(),
+            "QUICKJS_PREBUILT_LIB={} is not a file",
+            prebuilt.display()
+        );
+        std::fs::copy(&prebuilt, out_path.join(format!("lib{}.a", LIB_NAME)))
+            .expect("Could not copy the prebuilt QuickJS library");
+        println!("cargo:rustc-link-search=native={}", out_path.display());
+        println!("cargo:rustc-link-lib=static={}", LIB_NAME);
+        link_target_libraries(is_psp, &psp_root);
+        copy_bindings(&embed_path, &out_path);
+        return;
+    }
 
     let code_dir = out_path.join("quickjs");
     if exists(&code_dir) {
@@ -139,6 +159,13 @@ fn main() {
 
     build.compile(LIB_NAME);
 
+    link_target_libraries(is_psp, &psp_root);
+    copy_bindings(&embed_path, &out_path);
+}
+
+/// The PSP SDK's C libraries QuickJS calls into.
+#[cfg(feature = "bundled")]
+fn link_target_libraries(is_psp: bool, psp_root: &Path) {
     if is_psp {
         println!(
             "cargo:rustc-link-search=native={}",
@@ -151,7 +178,10 @@ fn main() {
             println!("cargo:rustc-link-lib=static:-bundle=cglue");
         }
     }
+}
 
+#[cfg(feature = "bundled")]
+fn copy_bindings(embed_path: &Path, out_path: &Path) {
     std::fs::copy(embed_path.join("bindings.rs"), out_path.join("bindings.rs"))
         .expect("Could not copy bindings.rs");
 }
