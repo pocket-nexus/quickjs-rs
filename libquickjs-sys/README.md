@@ -51,3 +51,24 @@ To updat the bindings, follow these steps:
 * (Install [just](https://github.com/casey/just))
 * Update the download URL in ./justfile
 * run `just update-quickjs`
+
+## Prebuilt PSP library
+
+`QUICKJS_PREBUILT_LIB=<path>` makes `build.rs` link the given static library
+instead of compiling QuickJS, so a build runs no C compiler. The library must
+come from this crate's sources at the same commit, for the same target.
+
+The `Prebuilt PSP library` workflow compiles the PSP library with
+`prebuilt/build-psp.sh`, the inputs pinned in `prebuilt/psp.env` (Rust
+toolchain, LLVM major version, PSP SDK release and SHA-256) and the flags a PSP
+host build uses, and publishes `libquickjs-mipsel-sony-psp.a` with
+`libquickjs-mipsel-sony-psp.json`, which records those inputs and the archive's
+SHA-256, as the release `prebuilt-psp-<commit>`.
+
+Locally:
+
+```sh
+LLVM_BIN=<dir with clang and llvm-ar> PSP_SDK=<extracted mipsel-sony-psp> \
+  libquickjs-sys/prebuilt/build-psp.sh dist
+```
+

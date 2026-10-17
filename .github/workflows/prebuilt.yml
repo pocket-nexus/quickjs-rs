@@ -1,0 +1,73 @@
+name: Prebuilt PSP library
+
+# Compiles libquickjs-sys for the PSP with the inputs pinned in
+# libquickjs-sys/prebuilt/psp.env and publishes the archive with its inputs
+# record as the release prebuilt-psp-<commit>. A PSP host links it through
+# QUICKJS_PREBUILT_LIB and runs no C compiler.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "libquickjs-sys/**"
+      - ".github/workflows/prebuilt.yml"
+  pull_request:
+    paths:
+      - "libquickjs-sys/**"
+      - ".github/workflows/prebuilt.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  psp:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned inputs
+        run: grep -E '^[A-Z][A-Z0-9_]*=' libquickjs-sys/prebuilt/psp.env >> "$GITHUB_ENV"
+
+      - name: Install LLVM ${{ env.LLVM_MAJOR }}
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh "$LLVM_MAJOR"
+          echo "LLVM_BIN=/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_ENV"
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rust-src
+
+      - name: Download the PSP SDK
+        run: |
+          curl -fsSL --retry 3 "$PSP_SDK_URL" -o psp-sdk.zip
+          echo "$PSP_SDK_SHA256  psp-sdk.zip" | sha256sum -c -
+          unzip -q psp-sdk.zip -d psp-sdk
+          test -f psp-sdk/mipsel-sony-psp/psp/lib/libc.a
+          echo "PSP_SDK=$PWD/psp-sdk/mipsel-sony-psp" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: libquickjs-sys/prebuilt/build-psp.sh dist
+
+      - name: Show inputs
+        run: cat dist/libquickjs-mipsel-sony-psp.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libquickjs-mipsel-sony-psp
+          path: dist/
+
+      - name: Release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="prebuilt-psp-${GITHUB_SHA::12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag exists"
+            exit 0
+          fi
+          gh release create "$tag" dist/libquickjs-mipsel-sony-psp.a dist/libquickjs-mipsel-sony-psp.json \
+            --target "$GITHUB_SHA" \
+            --title "Prebuilt QuickJS for the PSP (${GITHUB_SHA::12})" \
+            --notes "libquickjs-sys at $GITHUB_SHA compiled for mipsel-sony-psp. libquickjs-mipsel-sony-psp.json records the commit, QuickJS version, Rust toolchain, clang, PSP SDK and flags. Link it with QUICKJS_PREBUILT_LIB=<path to the .a>."
